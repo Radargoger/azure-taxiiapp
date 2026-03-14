@@ -1,0 +1,601 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "metadata": {
+        "title": "SOCRadar TAXII 2.1 for Microsoft Sentinel",
+        "description": "Imports STIX 2.1 threat intelligence indicators from SOCRadar TAXII server into Microsoft Sentinel using Azure Functions. Supports multiple collections, cursor-based pagination, checkpoint/resume, and batch upload.",
+        "version": "1.0.0",
+        "author": "SOCRadar",
+        "lastUpdateTime": "2026-03-08T00:00:00.000Z"
+    },
+    "parameters": {
+        "WorkspaceName": {
+            "type": "string",
+            "metadata": {
+                "description": "Microsoft Sentinel Log Analytics Workspace Name"
+            }
+        },
+        "WorkspaceLocation": {
+            "type": "string",
+            "defaultValue": "[resourceGroup().location]",
+            "metadata": {
+                "description": "Location/region of the Log Analytics workspace"
+            }
+        },
+        "ApiRoots": {
+            "type": "string",
+            "metadata": {
+                "description": "Comma-separated SOCRadar TAXII API root names (e.g., radar_alpha,radar_gamma)"
+            }
+        },
+        "CollectionIds": {
+            "type": "string",
+            "metadata": {
+                "description": "Comma-separated TAXII collection UUIDs matching API roots order (e.g., fd3fec42-...,f260cf45-...)"
+            }
+        },
+        "TAXIIUsername": {
+            "type": "string",
+            "metadata": {
+                "description": "TAXII server username (SOCRadar Company ID)"
+            }
+        },
+        "TAXIIPassword": {
+            "type": "securestring",
+            "metadata": {
+                "description": "TAXII server password (SOCRadar Platform API Key)"
+            }
+        },
+        "PollingIntervalMinutes": {
+            "type": "int",
+            "defaultValue": 60,
+            "minValue": 5,
+            "maxValue": 1440,
+            "metadata": {
+                "description": "How often to poll TAXII server (5-1440 minutes)"
+            }
+        },
+        "InitialLookbackHours": {
+            "type": "int",
+            "defaultValue": 48,
+            "minValue": 0,
+            "maxValue": 8760,
+            "metadata": {
+                "description": "Hours of history to fetch on first run (0 = all history, large collections may take several days to sync via checkpoints)"
+            }
+        },
+        "EnableAuditLogging": {
+            "type": "bool",
+            "defaultValue": true,
+            "metadata": {
+                "description": "Enable audit logging to SOCRadar_TAXII_Audit_CL custom table"
+            }
+        }
+    },
+    "variables": {
+        "functionAppName": "[concat('socradar-taxii-', uniqueString(resourceGroup().id))]",
+        "managedIdentityName": "SOCRadar-TAXII-MI",
+        "hostingPlanName": "SOCRadar-TAXII-Plan",
+        "storageAccountName": "[take(concat('srtaxii', uniqueString(resourceGroup().id)), 24)]",
+        "tableName": "TAXIIState",
+        "SentinelContributorRoleId": "ab8e14d6-4a74-4a29-9ba8-549422addade",
+        "StorageTableDataContributorRoleId": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+        "MonitoringMetricsPublisherRoleId": "3913510d-42f4-4e42-8a64-420c390055eb",
+        "WebsiteContributorRoleId": "de139f84-1756-47ae-9be6-808fbbe84772",
+        "appInsightsName": "[concat('socradar-taxii-ai-', uniqueString(resourceGroup().id))]",
+        "DceName": "SOCRadar-TAXII-DCE",
+        "AuditTableName": "SOCRadar_TAXII_Audit_CL",
+        "AuditDcrName": "SOCRadar-TAXII-Audit-DCR",
+        "AuditStreamName": "Custom-SOCRadar_TAXII_Audit_CL",
+        "workspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]",
+        "pollingSchedule": "[if(greaterOrEquals(parameters('PollingIntervalMinutes'), 60), concat('0 0 */', string(div(parameters('PollingIntervalMinutes'), 60)), ' * * *'), concat('0 */', string(parameters('PollingIntervalMinutes')), ' * * * *'))]"
+    },
+    "resources": [
+        {
+            "type": "Microsoft.OperationalInsights/workspaces",
+            "apiVersion": "2023-09-01",
+            "name": "[parameters('WorkspaceName')]",
+            "location": "[parameters('WorkspaceLocation')]",
+            "properties": {
+                "sku": {
+                    "name": "PerGB2018"
+                }
+            }
+        },
+        {
+            "type": "Microsoft.OperationsManagement/solutions",
+            "apiVersion": "2015-11-01-preview",
+            "name": "[concat('SecurityInsights(', parameters('WorkspaceName'), ')')]",
+            "location": "[parameters('WorkspaceLocation')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]"
+            ],
+            "plan": {
+                "name": "[concat('SecurityInsights(', parameters('WorkspaceName'), ')')]",
+                "publisher": "Microsoft",
+                "product": "OMSGallery/SecurityInsights",
+                "promotionCode": ""
+            },
+            "properties": {
+                "workspaceResourceId": "[variables('workspaceResourceId')]"
+            }
+        },
+        {
+            "type": "Microsoft.OperationalInsights/workspaces/providers/onboardingStates",
+            "apiVersion": "2024-03-01",
+            "name": "[concat(parameters('WorkspaceName'), '/Microsoft.SecurityInsights/default')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationsManagement/solutions', concat('SecurityInsights(', parameters('WorkspaceName'), ')'))]"
+            ],
+            "properties": {}
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "apiVersion": "2023-05-01",
+            "name": "[variables('storageAccountName')]",
+            "location": "[resourceGroup().location]",
+            "sku": {
+                "name": "Standard_LRS"
+            },
+            "kind": "StorageV2",
+            "properties": {
+                "supportsHttpsTrafficOnly": true,
+                "minimumTlsVersion": "TLS1_2"
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts/tableServices",
+            "apiVersion": "2023-05-01",
+            "name": "[concat(variables('storageAccountName'), '/default')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+            ]
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts/tableServices/tables",
+            "apiVersion": "2023-05-01",
+            "name": "[concat(variables('storageAccountName'), '/default/', variables('tableName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Storage/storageAccounts/tableServices', variables('storageAccountName'), 'default')]"
+            ]
+        },
+        {
+            "condition": "[parameters('EnableAuditLogging')]",
+            "type": "Microsoft.Insights/dataCollectionEndpoints",
+            "apiVersion": "2023-03-11",
+            "name": "[variables('DceName')]",
+            "location": "[parameters('WorkspaceLocation')]",
+            "properties": {
+                "description": "Data Collection Endpoint for SOCRadar TAXII audit logging",
+                "networkAcls": {
+                    "publicNetworkAccess": "Enabled"
+                }
+            }
+        },
+        {
+            "condition": "[parameters('EnableAuditLogging')]",
+            "type": "Microsoft.OperationalInsights/workspaces/tables",
+            "apiVersion": "2022-10-01",
+            "name": "[concat(parameters('WorkspaceName'), '/', variables('AuditTableName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]",
+                "[resourceId('Microsoft.OperationsManagement/solutions', concat('SecurityInsights(', parameters('WorkspaceName'), ')'))]"
+            ],
+            "properties": {
+                "schema": {
+                    "name": "[variables('AuditTableName')]",
+                    "columns": [
+                        {
+                            "name": "TimeGenerated",
+                            "type": "datetime",
+                            "description": "Event timestamp"
+                        },
+                        {
+                            "name": "ApiRoot",
+                            "type": "string",
+                            "description": "TAXII API root name"
+                        },
+                        {
+                            "name": "CollectionId",
+                            "type": "string",
+                            "description": "TAXII collection UUID"
+                        },
+                        {
+                            "name": "IndicatorsCreated",
+                            "type": "int",
+                            "description": "Indicators successfully uploaded"
+                        },
+                        {
+                            "name": "IndicatorsRevoked",
+                            "type": "int",
+                            "description": "Revoked indicators encountered"
+                        },
+                        {
+                            "name": "PagesFetched",
+                            "type": "int",
+                            "description": "TAXII pages fetched"
+                        },
+                        {
+                            "name": "DurationMs",
+                            "type": "int",
+                            "description": "Run duration in milliseconds"
+                        },
+                        {
+                            "name": "Status",
+                            "type": "string",
+                            "description": "Run status (Success, Failed)"
+                        },
+                        {
+                            "name": "ErrorMessage",
+                            "type": "string",
+                            "description": "Error details if any"
+                        }
+                    ]
+                },
+                "retentionInDays": 30,
+                "plan": "Analytics"
+            }
+        },
+        {
+            "condition": "[parameters('EnableAuditLogging')]",
+            "type": "Microsoft.Insights/dataCollectionRules",
+            "apiVersion": "2023-03-11",
+            "name": "[variables('AuditDcrName')]",
+            "location": "[parameters('WorkspaceLocation')]",
+            "dependsOn": [
+                "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('DceName'))]",
+                "[resourceId('Microsoft.OperationalInsights/workspaces/tables', parameters('WorkspaceName'), variables('AuditTableName'))]"
+            ],
+            "kind": "Direct",
+            "properties": {
+                "description": "DCR for SOCRadar TAXII audit log ingestion",
+                "dataCollectionEndpointId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('DceName'))]",
+                "streamDeclarations": {
+                    "[variables('AuditStreamName')]": {
+                        "columns": [
+                            {
+                                "name": "TimeGenerated",
+                                "type": "datetime"
+                            },
+                            {
+                                "name": "ApiRoot",
+                                "type": "string"
+                            },
+                            {
+                                "name": "CollectionId",
+                                "type": "string"
+                            },
+                            {
+                                "name": "IndicatorsCreated",
+                                "type": "int"
+                            },
+                            {
+                                "name": "IndicatorsRevoked",
+                                "type": "int"
+                            },
+                            {
+                                "name": "PagesFetched",
+                                "type": "int"
+                            },
+                            {
+                                "name": "DurationMs",
+                                "type": "int"
+                            },
+                            {
+                                "name": "Status",
+                                "type": "string"
+                            },
+                            {
+                                "name": "ErrorMessage",
+                                "type": "string"
+                            }
+                        ]
+                    }
+                },
+                "destinations": {
+                    "logAnalytics": [
+                        {
+                            "workspaceResourceId": "[variables('workspaceResourceId')]",
+                            "name": "workspace"
+                        }
+                    ]
+                },
+                "dataFlows": [
+                    {
+                        "streams": [
+                            "[variables('AuditStreamName')]"
+                        ],
+                        "destinations": [
+                            "workspace"
+                        ],
+                        "transformKql": "source",
+                        "outputStream": "[variables('AuditStreamName')]"
+                    }
+                ]
+            }
+        },
+        {
+            "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+            "apiVersion": "2023-01-31",
+            "name": "[variables('managedIdentityName')]",
+            "location": "[resourceGroup().location]"
+        },
+        {
+            "type": "Microsoft.Web/serverfarms",
+            "apiVersion": "2023-12-01",
+            "name": "[variables('hostingPlanName')]",
+            "location": "[resourceGroup().location]",
+            "sku": {
+                "name": "Y1",
+                "tier": "Dynamic"
+            },
+            "kind": "functionapp",
+            "properties": {
+                "reserved": true
+            }
+        },
+        {
+            "type": "Microsoft.Insights/components",
+            "apiVersion": "2020-02-02",
+            "name": "[variables('appInsightsName')]",
+            "location": "[resourceGroup().location]",
+            "kind": "web",
+            "dependsOn": [
+                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]"
+            ],
+            "properties": {
+                "Application_Type": "web",
+                "WorkspaceResourceId": "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]",
+                "RetentionInDays": 30
+            }
+        },
+        {
+            "type": "Microsoft.Web/sites",
+            "apiVersion": "2023-12-01",
+            "name": "[variables('functionAppName')]",
+            "location": "[resourceGroup().location]",
+            "kind": "functionapp,linux",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]": {}
+                }
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+                "[resourceId('Microsoft.Web/serverfarms', variables('hostingPlanName'))]",
+                "[resourceId('Microsoft.OperationalInsights/workspaces', parameters('WorkspaceName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts/tableServices/tables', variables('storageAccountName'), 'default', variables('tableName'))]",
+                "[resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('DceName'))]",
+                "[resourceId('Microsoft.Insights/dataCollectionRules', variables('AuditDcrName'))]",
+                "[resourceId('Microsoft.Insights/components', variables('appInsightsName'))]"
+            ],
+            "properties": {
+                "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('hostingPlanName'))]",
+                "httpsOnly": true,
+                "siteConfig": {
+                    "linuxFxVersion": "Python|3.11",
+                    "appSettings": [
+                        {
+                            "name": "AzureWebJobsStorage",
+                            "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', variables('storageAccountName'), ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2023-05-01').keys[0].value, ';EndpointSuffix=core.windows.net')]"
+                        },
+                        {
+                            "name": "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+                            "value": "[concat('DefaultEndpointsProtocol=https;AccountName=', variables('storageAccountName'), ';AccountKey=', listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2023-05-01').keys[0].value, ';EndpointSuffix=core.windows.net')]"
+                        },
+                        {
+                            "name": "WEBSITE_CONTENTSHARE",
+                            "value": "[variables('functionAppName')]"
+                        },
+                        {
+                            "name": "FUNCTIONS_EXTENSION_VERSION",
+                            "value": "~4"
+                        },
+                        {
+                            "name": "FUNCTIONS_WORKER_RUNTIME",
+                            "value": "python"
+                        },
+                        {
+                            "name": "AzureWebJobsFeatureFlags",
+                            "value": "EnableWorkerIndexing"
+                        },
+                        {
+                            "name": "APPLICATIONINSIGHTS_CONNECTION_STRING",
+                            "value": "[reference(resourceId('Microsoft.Insights/components', variables('appInsightsName')), '2020-02-02').ConnectionString]"
+                        },
+                        {
+                            "name": "WEBSITE_RUN_FROM_PACKAGE",
+                            "value": "https://github.com/orcunsami/SOCRadar-Azure-TAXII21/releases/download/v1.0.0/FunctionApp.zip"
+                        },
+                        {
+                            "name": "AZURE_CLIENT_ID",
+                            "value": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').clientId]"
+                        },
+                        {
+                            "name": "POLLING_SCHEDULE",
+                            "value": "[variables('pollingSchedule')]"
+                        },
+                        {
+                            "name": "API_ROOTS",
+                            "value": "[parameters('ApiRoots')]"
+                        },
+                        {
+                            "name": "COLLECTION_IDS",
+                            "value": "[parameters('CollectionIds')]"
+                        },
+                        {
+                            "name": "INITIAL_LOOKBACK_HOURS",
+                            "value": "[parameters('InitialLookbackHours')]"
+                        },
+                        {
+                            "name": "TAXII_USERNAME",
+                            "value": "[parameters('TAXIIUsername')]"
+                        },
+                        {
+                            "name": "TAXII_PASSWORD",
+                            "value": "[parameters('TAXIIPassword')]"
+                        },
+                        {
+                            "name": "WORKSPACE_ID",
+                            "value": "[reference(variables('workspaceResourceId'), '2023-09-01').customerId]"
+                        },
+                        {
+                            "name": "STORAGE_ACCOUNT_NAME",
+                            "value": "[variables('storageAccountName')]"
+                        },
+                        {
+                            "name": "ENABLE_AUDIT_LOGGING",
+                            "value": "[string(parameters('EnableAuditLogging'))]"
+                        },
+                        {
+                            "name": "AUDIT_DCR_ENDPOINT",
+                            "value": "[if(parameters('EnableAuditLogging'), reference(resourceId('Microsoft.Insights/dataCollectionEndpoints', variables('DceName')), '2023-03-11').logsIngestion.endpoint, '')]"
+                        },
+                        {
+                            "name": "AUDIT_DCR_IMMUTABLE_ID",
+                            "value": "[if(parameters('EnableAuditLogging'), reference(resourceId('Microsoft.Insights/dataCollectionRules', variables('AuditDcrName')), '2023-03-11').immutableId, '')]"
+                        },
+                        {
+                            "name": "AUDIT_STREAM_NAME",
+                            "value": "[variables('AuditStreamName')]"
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceGroup().id, variables('managedIdentityName'), variables('SentinelContributorRoleId'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('SentinelContributorRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+            }
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('managedIdentityName'), variables('StorageTableDataContributorRoleId'))]",
+            "scope": "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('StorageTableDataContributorRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+            }
+        },
+        {
+            "condition": "[parameters('EnableAuditLogging')]",
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceId('Microsoft.Insights/dataCollectionRules', variables('AuditDcrName')), variables('managedIdentityName'), variables('MonitoringMetricsPublisherRoleId'))]",
+            "scope": "[resourceId('Microsoft.Insights/dataCollectionRules', variables('AuditDcrName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+                "[resourceId('Microsoft.Insights/dataCollectionRules', variables('AuditDcrName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('MonitoringMetricsPublisherRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+            }
+        },
+        {
+            "type": "Microsoft.Authorization/roleAssignments",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceId('Microsoft.Web/sites', variables('functionAppName')), variables('managedIdentityName'), variables('WebsiteContributorRoleId'))]",
+            "scope": "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]",
+            "dependsOn": [
+                "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]",
+                "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]"
+            ],
+            "properties": {
+                "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('WebsiteContributorRoleId'))]",
+                "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName')), '2023-01-31').principalId]",
+                "principalType": "ServicePrincipal"
+            }
+        },
+        {
+            "condition": "[parameters('EnableAuditLogging')]",
+            "type": "Microsoft.Insights/workbooks",
+            "apiVersion": "2022-04-01",
+            "name": "[guid(resourceGroup().id, 'SOCRadar-TAXII-Workbook')]",
+            "location": "[parameters('WorkspaceLocation')]",
+            "kind": "shared",
+            "dependsOn": [
+                "[variables('workspaceResourceId')]"
+            ],
+            "properties": {
+                "displayName": "SOCRadar TAXII 2.1 Dashboard",
+                "serializedData": "{\"version\":\"Notebook/1.0\",\"items\":[{\"type\":1,\"content\":{\"json\":\"## SOCRadar TAXII 2.1 Dashboard\\nThreat intelligence indicator analytics from SOCRadar TAXII 2.1 feed imports.\"},\"name\":\"header\"},{\"type\":1,\"content\":{\"json\":\"---\\n### Overview\"},\"name\":\"overview-header\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| summarize Count=dcount(Id)\\n| project Count\",\"size\":4,\"title\":\"Total TI Indicators\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"tiles\",\"tileSettings\":{\"titleContent\":{\"columnMatch\":\"Count\",\"formatter\":12,\"formatOptions\":{\"palette\":\"auto\"}},\"showBorder\":false}},\"customWidth\":\"25\",\"name\":\"total-indicators\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| extend TagList = split(Tags, \\\",\\\")\\n| mv-expand Tag = TagList\\n| where tostring(Tag) startswith \\\"collection-\\\"\\n| summarize Count=dcount(tostring(Tag))\\n| project Count\",\"size\":4,\"title\":\"Active Sources\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"tiles\",\"tileSettings\":{\"titleContent\":{\"columnMatch\":\"Count\",\"formatter\":12,\"formatOptions\":{\"palette\":\"auto\"}},\"showBorder\":false}},\"customWidth\":\"25\",\"name\":\"active-sources\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| summarize Count=dcount(ObservableKey)\\n| project Count\",\"size\":4,\"title\":\"Indicator Types\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"tiles\",\"tileSettings\":{\"titleContent\":{\"columnMatch\":\"Count\",\"formatter\":12,\"formatOptions\":{\"palette\":\"auto\"}},\"showBorder\":false}},\"customWidth\":\"25\",\"name\":\"indicator-types\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| where TimeGenerated > ago(24h)\\n| summarize Count=dcount(Id)\\n| project Count\",\"size\":4,\"title\":\"Last 24 Hours\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"tiles\",\"tileSettings\":{\"titleContent\":{\"columnMatch\":\"Count\",\"formatter\":12,\"formatOptions\":{\"palette\":\"auto\"}},\"showBorder\":false}},\"customWidth\":\"25\",\"name\":\"last-24h\"},{\"type\":1,\"content\":{\"json\":\"---\\n### Indicator Analysis\"},\"name\":\"analysis-header\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| summarize Count=count() by ObservableKey\\n| order by Count desc\",\"size\":2,\"title\":\"Indicators by Type\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"piechart\"},\"customWidth\":\"50\",\"name\":\"indicators-by-type\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| extend TagList = split(Tags, \\\",\\\")\\n| mv-expand Tag = TagList\\n| where tostring(Tag) startswith \\\"collection-\\\"\\n| summarize Count=count() by tostring(Tag)\\n| order by Count desc\",\"size\":2,\"title\":\"Indicators by Source\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"barchart\"},\"customWidth\":\"50\",\"name\":\"indicators-by-source\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| summarize Count=count() by bin(TimeGenerated, 1h)\\n| order by TimeGenerated asc\",\"size\":0,\"title\":\"Indicators Over Time\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"timechart\"},\"name\":\"indicators-timeline\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"ThreatIntelIndicators\\n| where SourceSystem == \\\"SOCRadar TAXII\\\"\\n| project TimeGenerated, ObservableKey, ObservableValue, Confidence, ValidFrom, ValidUntil\\n| order by TimeGenerated desc\\n| take 50\",\"size\":0,\"title\":\"Recent Indicators\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"table\"},\"name\":\"recent-indicators\"},{\"type\":1,\"content\":{\"json\":\"---\\n### Audit Monitoring\"},\"name\":\"audit-header\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"SOCRadar_TAXII_Audit_CL\\n| summarize Count=count() by Status\\n| order by Count desc\",\"size\":2,\"title\":\"Import Run Status\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"piechart\"},\"customWidth\":\"50\",\"name\":\"audit-status\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"SOCRadar_TAXII_Audit_CL\\n| summarize Created=sum(IndicatorsCreated), Revoked=sum(IndicatorsRevoked) by bin(TimeGenerated, 1h)\\n| order by TimeGenerated asc\",\"size\":0,\"title\":\"Indicators Created vs Revoked\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"timechart\"},\"customWidth\":\"50\",\"name\":\"created-vs-revoked\"},{\"type\":3,\"content\":{\"version\":\"KqlItem/1.0\",\"query\":\"SOCRadar_TAXII_Audit_CL\\n| project TimeGenerated, ApiRoot, CollectionId, IndicatorsCreated, IndicatorsRevoked, DurationMs, Status, ErrorMessage\\n| order by TimeGenerated desc\\n| take 20\",\"size\":0,\"title\":\"Recent Import Runs\",\"queryType\":0,\"resourceType\":\"microsoft.operationalinsights/workspaces\",\"visualization\":\"table\"},\"name\":\"recent-runs\"}],\"isLocked\":false,\"fallbackResourceIds\":[\"/subscriptions/{Subscription}/resourceGroups/{ResourceGroup}/providers/Microsoft.OperationalInsights/workspaces/{Workspace}\"]}",
+                "version": "1.0",
+                "sourceId": "[variables('workspaceResourceId')]",
+                "category": "sentinel"
+            }
+        },
+        {
+            "type": "Microsoft.Resources/deploymentScripts",
+            "apiVersion": "2020-10-01",
+            "name": "[concat('triggerFirstRun-', uniqueString(resourceGroup().id))]",
+            "location": "[resourceGroup().location]",
+            "kind": "AzureCLI",
+            "identity": {
+                "type": "UserAssigned",
+                "userAssignedIdentities": {
+                    "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', variables('managedIdentityName'))]": {}
+                }
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.Web/sites', variables('functionAppName'))]",
+                "[guid(resourceId('Microsoft.Web/sites', variables('functionAppName')), variables('managedIdentityName'), variables('WebsiteContributorRoleId'))]"
+            ],
+            "properties": {
+                "azCliVersion": "2.50.0",
+                "retentionInterval": "PT1H",
+                "timeout": "PT5M",
+                "scriptContent": "sleep 30 && az functionapp restart --name $FA_NAME --resource-group $RG_NAME && echo 'Function App restarted, run_on_startup will trigger first import'",
+                "environmentVariables": [
+                    {
+                        "name": "FA_NAME",
+                        "value": "[variables('functionAppName')]"
+                    },
+                    {
+                        "name": "RG_NAME",
+                        "value": "[resourceGroup().name]"
+                    }
+                ]
+            }
+        }
+    ],
+    "outputs": {
+        "functionAppName": {
+            "type": "string",
+            "value": "[variables('functionAppName')]"
+        },
+        "storageAccountName": {
+            "type": "string",
+            "value": "[variables('storageAccountName')]"
+        },
+        "pollingSchedule": {
+            "type": "string",
+            "value": "[variables('pollingSchedule')]"
+        },
+        "auditTableName": {
+            "type": "string",
+            "value": "[if(parameters('EnableAuditLogging'), variables('AuditTableName'), 'N/A')]"
+        },
+        "workbookName": {
+            "type": "string",
+            "value": "[if(parameters('EnableAuditLogging'), 'SOCRadar TAXII 2.1 Dashboard', 'N/A')]"
+        }
+    }
+}
