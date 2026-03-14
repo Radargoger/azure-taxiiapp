@@ -4,7 +4,7 @@ Imports STIX 2.1 threat intelligence indicators from SOCRadar TAXII server into 
 
 ## Deployment
 
-[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Forcunsami%2FSOCRadar-Azure-TAXII21%2Fmaster%2Fazuredeploy.json)
+[![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FRadargoger%2Fazure-taxiiapp%2Fmaster%2Fazuredeploy.json)
 
 Click the button above. Fill in the parameters and click **Create**. The function app and code are deployed automatically.
 
