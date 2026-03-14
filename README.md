@@ -119,8 +119,3 @@ Both tables are also visualized in the **SOCRadar TAXII 2.1 Dashboard** workbook
 SOCRadar is an Extended Threat Intelligence (XTI) platform.
 
 Learn more at [socradar.io](https://socradar.io)
-
-## Support
-
-- **Documentation:** [docs.socradar.io](https://docs.socradar.io)
-- **Support:** support@socradar.io
